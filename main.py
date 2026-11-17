@@ -5,19 +5,27 @@ I/O contract (unchanged from the starter): read every *.in under MAKEFUN_INPUT_D
 2..24 with five finite quantiles, non-decreasing, in (0, 1e9].
 
 Model:
-  1. p1 = hour 1's print from the case's `known` rows.
-  2. Each comparable launch is aligned on its own unlock hour, detected in the data as the
-     biggest one-hour log jump in viewers within the first 72h of its series (the free-text
-     `unlock` field is research prose, not machine-readable, so the data picks the hour).
-  3. For each delta d = 0..23 after unlock, m[d] = mean over comparables of
+  1. p1 = hour 1's print from the case's `known` rows. Every forecast hour is p1 times a
+     multiplier, so what we estimate is the shape of the path, not its level.
+  2. Each comparable launch is aligned on its own unlock hour, taken to be the biggest
+     one-hour log jump in the first 72h of its series (the free-text `unlock` field is
+     research prose, not machine-readable, so the data picks the hour).
+  3. For each distance d = 0..23 after unlock, m[d] = mean over comparables of
      log(viewers[unlock + d] / viewers[unlock]): the average multiplicative log decay.
-  4. The median path for the target case is p1 * exp(w(d) * m[d]) with w(d) = d / (d + 4):
-     at hour distance 0 it is pure p1, and the comparable curve takes over as d grows.
-  5. Spread is the starter's random walk in log space, sigma = 0.15 per sqrt-hour:
-     q_tau(h) = median(h) * exp(z_tau * 0.15 * sqrt(h - 1)). The five quantiles are sorted
-     so the row is non-decreasing no matter what the curve does, then clamped to (0, 1e9].
-     Tweaks in the second session: BLEND_K retuned from 4.0 to 3.0 after seeing the practice
-     outputs, and spike search window widened from 48 to 72 hours.
+     A comparable contributes only where it has data, so short series still inform the
+     early hours instead of being dropped whole. The raw curve is then smoothed with a
+     1-2-1 filter over neighbouring hours, which damps single-hour noise and fills the
+     gaps left at large d by series that ran out. d = 0 stays pinned at 0: it is the
+     unlock hour itself, log(base / base).
+  4. The median path for the target case is p1 * exp(w(d) * m[d]) with
+     w(d) = d / (d + BLEND_K): at distance 0 it is pure persistence, and the comparable
+     curve takes over as d grows.
+  5. Spread is two log-space terms added in quadrature: the random walk of the hourly
+     print, SIGMA * sqrt(d), and the uncertainty of the decay estimate itself,
+     w(d) * s[d], where s[d] is the spread of comparables' log ratios around m[d].
+     So q_tau(h) = median(h) * exp(z_tau * sigma(h)). The five quantiles are sorted so
+     the row is non-decreasing no matter what the curve does, then clamped to
+     [Q_FLOOR, Q_CEIL].
 """
 
 import json
@@ -34,6 +42,9 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
 # Spread of an hour's move, in natural-log units per square-root hour.
 SIGMA = 0.15
+# Floor on the per-distance dispersion of comparable log ratios, so a curve estimated
+# from one or two comparables still admits it could be wrong.
+SPREAD_FLOOR = 0.05
 # How quickly the comparable decay curve takes over from pure persistence:
 # w(d) = d / (d + BLEND_K), so hour distance d=4 gets half the curve, d=24 about 86%.
 BLEND_K = 3.0
@@ -56,27 +67,52 @@ def round2(x: float) -> float | int:
     return int(value) if value.is_integer() else value
 
 
-def mean_log_decay_curve(comparables: list) -> list[float]:
-    """m[d] = mean over comparables of log(viewers[unlock + d] / viewers[unlock]), d = 0..23.
+def smooth_121(xs: list[float], pin_first: bool = True) -> list[float]:
+    """1-2-1 smoothing across neighbouring hours, renormalised at the ends.
 
-    A comparable contributes to d only if it has data at unlock + d; comparables whose
-    series is too short simply drop out of the average for large d. If nothing is usable,
-    the curve is flat at 0 (pure persistence).
+    The raw per-distance averages are noisy: one comparable having an odd hour drags the
+    estimate at that distance alone, and distance d can be estimated from fewer
+    comparables than d-1 and d+1. A [1, 2, 1] kernel spreads each observation over its
+    neighbours, so the curve moves in ones and twos instead of jumping. Index 0 is the
+    unlock hour, where the log ratio is exactly 0 by construction; leave it alone.
     """
-    sums = [0.0] * DECAY_HORIZON
-    counts = [0] * DECAY_HORIZON
+    if not xs:
+        return []
+    out = []
+    for i in range(len(xs)):
+        if pin_first and i == 0:
+            out.append(xs[0])
+            continue
+        total = weight = 0.0
+        for j, wj in ((i - 1, 1.0), (i, 2.0), (i + 1, 1.0)):
+            if 0 <= j < len(xs):
+                total += wj * xs[j]
+                weight += wj
+        out.append(total / weight)
+    return out
+
+
+def comparable_curves(comparables: list) -> tuple[list[float], list[float]]:
+    """Return (m, s) over d = 0..23: the mean log decay and its dispersion.
+
+    m[d] = mean over comparables of log(viewers[unlock + d] / viewers[unlock]).
+    s[d] = their sample standard deviation; 0 when only one comparable reaches d.
+    A comparable contributes at distance d only if it has data there, so a short series
+    still informs the early hours rather than being dropped whole. If nothing is usable,
+    the curve is flat at 0 (pure persistence) with no extra spread.
+    """
+    samples: list[list[float]] = [[] for _ in range(DECAY_HORIZON)]
     for comp in comparables:
         hourly = comp.get("hourly") or []
-        if len(hourly) < DECAY_HORIZON + 1:
-            continue
         viewers = []
         for row in hourly:
             try:
                 viewers.append(max(1, int(row.get("viewers", 0))))
             except (TypeError, ValueError):
                 viewers.append(1)
+        if len(viewers) < 2:
+            continue
         # Align on the biggest one-hour log jump within the spike window: the unlock.
-        v0 = viewers[0]
         spike, best = 0, 0.0
         for i in range(1, min(SPIKE_WINDOW, len(viewers))):
             if viewers[i - 1] >= 1 and viewers[i] > viewers[i - 1]:
@@ -84,23 +120,40 @@ def mean_log_decay_curve(comparables: list) -> list[float]:
                 if jump > best:
                     best, spike = jump, i
         base = viewers[spike]
-        if base < 1:
-            continue
         for d in range(DECAY_HORIZON):
             j = spike + d
             if j >= len(viewers):
                 break
-            sums[d] += math.log(max(1, viewers[j]) / base)
-            counts[d] += 1
-    return [sums[d] / counts[d] if counts[d] else 0.0 for d in range(DECAY_HORIZON)]
+            samples[d].append(math.log(max(1, viewers[j]) / base))
+
+    m, s = [], []
+    for d in range(DECAY_HORIZON):
+        xs = samples[d]
+        if not xs:
+            m.append(0.0)
+            s.append(0.0)
+            continue
+        mu = sum(xs) / len(xs)
+        m.append(mu)
+        if len(xs) < 2:
+            s.append(0.0)
+        else:
+            var = sum((x - mu) ** 2 for x in xs) / (len(xs) - 1)
+            s.append(max(SPREAD_FLOOR, math.sqrt(var)))
+    return smooth_121(m), smooth_121(s)
 
 
-def hour_quantiles(p1: float, d: int, curve: list[float]) -> list[float | int]:
-    """Hour d+1's five quantiles: the blended decay curve widened by the random walk."""
+def hour_quantiles(p1: float, d: int, curve: list[float], spread: list[float]) -> list[float | int]:
+    """Hour d+1's five quantiles: the blended decay curve widened by its own error."""
     w = d / (d + BLEND_K)
     m = curve[min(d, len(curve) - 1)] if curve else 0.0
+    s = spread[min(d, len(spread) - 1)] if spread else 0.0
     median = p1 * math.exp(w * m)
-    raw = [median * math.exp(z * SIGMA * math.sqrt(d)) for z in Z]
+    # Two independent risks in quadrature: hour-to-hour wander, and being wrong about
+    # where the comparable curve lands. The second scales with w, since it only bites
+    # as far as the curve drives the median.
+    sigma = math.sqrt(SIGMA**2 * d + (w * s) ** 2)
+    raw = [median * math.exp(z * sigma) for z in Z]
     qs = sorted(round2(x) for x in raw)
     qs = [min(max(q, Q_FLOOR), Q_CEIL) for q in qs]
     # round2 is monotone, and sorting precedes clamping, so this running max only ever
@@ -118,10 +171,10 @@ def forecast_case(case: dict, name: str) -> dict:
     if first is None:
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1, first["viewers"])
-    curve = mean_log_decay_curve(case.get("comparables") or [])
+    curve, spread = comparable_curves(case.get("comparables") or [])
     return {
         "hours": [
-            {"hour": row["hour"], "q": hour_quantiles(p1, row["hour"] - 1, curve)}
+            {"hour": row["hour"], "q": hour_quantiles(p1, row["hour"] - 1, curve, spread)}
             for row in case["forecast"]
         ]
     }
