@@ -1,16 +1,9 @@
-"""Comparable-launch decay forecaster.
+"""Offline hour-by-hour retention forecaster.
 
-Reads case files (*.in) describing a game/content launch: the creator's own
-hour-1 viewership baseline ("known") plus a set of comparable launches with
-hourly viewership series. For each comparable we locate the "unlock" hour -
-the biggest one-hour log jump in viewers within the first 72 entries - then
-build an average post-unlock decay/retention curve in log space. The target's
-quantile trajectory for hours 2..24 is the hour-1 baseline multiplied by a
-smoothed, time-weighted mean log ratio, with spread from the sample std of
-those ratios, and each tau quantile is median * exp(z_tau * sigma).
-
-Inputs:  $MAKEFUN_INPUT_DIR  (default /input)  - case files <stem>.in
-Outputs: $MAKEFUN_OUTPUT_DIR (default /output) - <stem>.out, one-line JSON
+The script reads benchmark cases describing a release checkpoint and a set
+of comparable titles, then projects the viewer distribution for hours 2-24
+of the target title.  Everything is deterministic and uses only the Python
+standard library.
 """
 
 import json
@@ -18,219 +11,218 @@ import math
 import os
 from pathlib import Path
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+DEFAULT_INPUT = "/input"
+DEFAULT_OUTPUT = "/output"
+
+MAX_LAG = 23          # hours 2..24 correspond to retention lags 1..23
+SCAN_LIMIT = 72       # how many early samples are searched for the unlock
+MIN_WEIGHT = 0.05     # comparables further away than this are ignored
+RATIO_FLOOR = 1.0 / 50.0
+RATIO_CEIL = 2.0
+EARLY_CAP = 0.90      # hour 2 keeps at least a 10% drop from the hour-1 peak
+LATE_WIDEN = 0.015    # each late hour stretches the quantile band a bit more
 
 
-def load_case(path):
-    """Load one case file and return its parsed JSON payload."""
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+def _days_from_civil(year, month, day):
+    """Return the number of days between 1970-01-01 and the given date."""
+    year -= 1 if month <= 2 else 0
+    era = (year if year >= 0 else year - 399) // 400
+    yoe = year - era * 400
+    doy = (153 * (month - 3 if month > 2 else month + 9) + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
 
 
-MIN_ROWS = 12           # comparables with fewer hourly rows are skipped
-SCAN_WINDOW = 72        # unlock jump searched within first 72 hourly entries
-HORIZON_D = 23          # offsets d = 0..23 -> hours 1..24
-Q_CAP = 1e9
-Z = {5: -1.6449, 25: -0.6745, 50: 0.0, 75: 0.6745, 95: 1.6449}
+def _parse_stamp(text):
+    """Split an ISO timestamp into (whole days, seconds within the day)."""
+    raw = str(text).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1]
+    if "T" in raw:
+        date_part, _, time_part = raw.partition("T")
+    else:
+        date_part, _, time_part = raw.partition(" ")
+    y, m, d = (int(piece) for piece in date_part.split("-")[:3])
+    hour = minute = second = 0
+    if time_part:
+        time_part = time_part.split("+")[0]
+        chunks = time_part.split(":")
+        if chunks and chunks[0]:
+            hour = int(chunks[0])
+        if len(chunks) > 1 and chunks[1]:
+            minute = int(chunks[1])
+        if len(chunks) > 2 and chunks[2]:
+            second = int(float(chunks[2]))
+    return _days_from_civil(y, m, d), hour * 3600 + minute * 60 + second
 
 
-def _viewers(row):
-    if isinstance(row, dict):
-        for key in ("viewers", "viewership", "views", "value"):
-            if key in row:
-                return float(row[key])
-        raise KeyError("no viewers field in row")
-    return float(row)
+def _hours_between(stamp, origin):
+    day, sec = stamp
+    return (day - origin[0]) * 24.0 + (sec - origin[1]) / 3600.0
 
 
-def _mean(xs):
-    return sum(xs) / len(xs)
+def _viewer_series(comparable):
+    """Return (day_start stamp, [(hour index, viewers), ...])."""
+    origin = _parse_stamp(comparable.get("day_start"))
+    collected = {}
+    for sample in comparable.get("hourly") or []:
+        try:
+            viewers = float(sample.get("viewers"))
+            position = _hours_between(_parse_stamp(sample.get("from")), origin)
+        except (TypeError, ValueError, IndexError, AttributeError):
+            continue
+        if viewers < 0 or not math.isfinite(viewers):
+            continue
+        collected[int(round(position))] = viewers
+    return origin, sorted(collected.items())
 
 
-def _sample_std(xs):
-    if len(xs) < 2:
-        return 0.0
-    mu = _mean(xs)
-    return math.sqrt(sum((x - mu) ** 2 for x in xs) / (len(xs) - 1))
+def _find_unlock(points):
+    """Locate the steepest early climb in log viewers."""
+    window = points[:SCAN_LIMIT]
+    first_index = window[0][0]
+    best_gain = -1.0
+    best_index = first_index
+    prev_index, prev_viewers = window[0]
+    for index, viewers in window[1:]:
+        if index > prev_index and prev_viewers > 0 and viewers > 0:
+            gain = (math.log(viewers) - math.log(prev_viewers)) / (index - prev_index)
+            if gain > best_gain:
+                best_gain = gain
+                best_index = index
+        prev_index, prev_viewers = index, viewers
+    if best_gain <= 0:
+        return first_index
+    return best_index
 
 
-def _p1(case):
-    """Hour-1 viewers print from the case's own 'known' rows."""
-    by_hour = {}
-    for row in case.get("known") or []:
-        if isinstance(row, dict):
-            by_hour[int(row.get("hour", 1))] = _viewers(row)
+def _retention_profile(points, unlock):
+    """Ratios viewers(unlock + h) / viewers(unlock) for h in 1..23."""
+    baseline = None
+    for index, viewers in points:
+        if index == unlock:
+            baseline = viewers
+            break
+    if not baseline or baseline <= 0:
+        return {}
+    profile = {}
+    for index, viewers in points:
+        lag = index - unlock
+        if 1 <= lag <= MAX_LAG:
+            profile[lag] = viewers / baseline
+    return profile
+
+
+def _interpolate(profile, lag):
+    """Geometric interpolation of a retention profile, clamped."""
+    if not profile:
+        return 1.0
+    if lag in profile:
+        value = profile[lag]
+    else:
+        lags = sorted(profile)
+        if lag < lags[0]:
+            value = profile[lags[0]]
+        elif lag > lags[-1]:
+            value = profile[lags[-1]]
         else:
-            by_hour.setdefault(1, _viewers(row))
-    if 1 in by_hour:
-        return by_hour[1]
-    if by_hour:
-        return by_hour[min(by_hour)]
-    raise ValueError("case has no hour-1 'known' viewers")
+            lower = max(step for step in lags if step < lag)
+            upper = min(step for step in lags if step > lag)
+            share = (lag - lower) / float(upper - lower)
+            left = math.log(max(profile[lower], 1e-9))
+            right = math.log(max(profile[upper], 1e-9))
+            value = math.exp(left + share * (right - left))
+    return min(RATIO_CEIL, max(RATIO_FLOOR, value))
 
 
-def _unlock_hour(series):
-    """Index of the biggest one-hour log jump within the first SCAN_WINDOW."""
-    best_u, best_jump = None, None
-    for u in range(1, min(SCAN_WINDOW, len(series))):
-        prev, cur = series[u - 1], series[u]
-        if prev <= 0.0 or cur <= 0.0:
+def _weight_for(checkpoint, day_start):
+    gap = abs(checkpoint[0] - day_start[0])
+    return 1.0 / (1.0 + gap / 30.0)
+
+
+def _forecast(case):
+    try:
+        checkpoint = _parse_stamp(case.get("checkpoint"))
+    except (TypeError, ValueError, IndexError):
+        checkpoint = (0, 0)
+
+    peak = 0.0
+    parts = []
+    for comparable in case.get("comparables") or []:
+        try:
+            day_start, points = _viewer_series(comparable)
+        except (TypeError, ValueError, IndexError):
             continue
-        jump = math.log(cur) - math.log(prev)
-        if best_jump is None or jump > best_jump:
-            best_u, best_jump = u, jump
-    return best_u
-
-
-def forecast_case(case):
-    """Compute the quantile forecast for one case."""
-    p1 = _p1(case)
-    ratios = {d: [] for d in range(HORIZON_D + 1)}
-    for comp in case.get("comparables") or []:
-        hourly = comp.get("hourly") if isinstance(comp, dict) else comp
-        series = [_viewers(r) for r in (hourly or [])]
-        if len(series) < MIN_ROWS:
+        if not points:
             continue
-        u = _unlock_hour(series)
-        if u is None or series[u] <= 0.0:
+        peak = max(peak, max(viewers for _, viewers in points))
+        weight = _weight_for(checkpoint, day_start)
+        if weight < MIN_WEIGHT:
             continue
-        for d in range(HORIZON_D + 1):
-            idx = u + d
-            if idx < len(series) and series[idx] > 0.0:
-                ratios[d].append(math.log(series[idx] / series[u]))
-
-    m = [0.0] + [_mean(ratios[d]) if ratios[d] else 0.0
-                 for d in range(1, HORIZON_D + 1)]
-    ms = [(m[max(d - 1, 0)] + 2.0 * m[d] + m[min(d + 1, HORIZON_D)]) / 4.0
-          for d in range(HORIZON_D + 1)]
+        unlock = _find_unlock(points)
+        profile = _retention_profile(points, unlock)
+        if profile:
+            parts.append((weight, profile))
+    if peak <= 0:
+        peak = 1.0
 
     hours = []
-    for h in range(2, 25):
-        d = h - 1
-        w = d / (d + 3.0)
-        s = _sample_std(ratios[d]) if ratios[d] else 0.0
-        median = p1 * math.exp(w * ms[d])
-        sigma = math.sqrt((0.15 * math.sqrt(d)) ** 2 + (w * s) ** 2)
-        qs = sorted(round(min(max(median * math.exp(Z[tau] * sigma), 0.0), Q_CAP), 2)
-                    for tau in (5, 25, 50, 75, 95))
-        hours.append({"hour": h, "q": qs})
+    floor = None
+    for hour in range(2, MAX_LAG + 2):
+        lag = hour - 1
+        if parts:
+            numerator = 0.0
+            denominator = 0.0
+            for weight, profile in parts:
+                numerator += weight * math.log(_interpolate(profile, lag))
+                denominator += weight
+            median = peak * math.exp(numerator / denominator) if denominator else peak
+        else:
+            median = peak * math.exp(-0.08 * math.sqrt(lag))
+        median = min(median, peak)
+        if hour == 2:
+            # The release spike peaks at the end of hour 1, so the very first
+            # projected hour must already sit below that baseline.
+            median = min(median, peak * EARLY_CAP)
+        elif hour == 3:
+            # Hour 2 compressed the path early, so hour 3 follows it down.
+            median = min(median, peak * EARLY_CAP * 0.92)
+        if floor is not None and median > floor:
+            median = floor
+        floor = median
+
+        sigma = 0.15 * math.sqrt(hour)
+        if hour > 12:
+            # Uncertainty keeps compounding past the first half day.
+            sigma += LATE_WIDEN * (hour - 12)
+        quantiles = [
+            median * math.exp(-1.645 * sigma),
+            median * math.exp(-0.674 * sigma),
+            median,
+            median * math.exp(0.674 * sigma),
+            median * math.exp(1.645 * sigma),
+        ]
+        hours.append({"hour": hour, "q": [round(value, 2) for value in quantiles]})
     return {"hours": hours}
 
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = load_case(path)
-        result = forecast_case(case)
-        out_path = OUTPUT_DIR / (path.stem + ".out")
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(result, separators=(",", ":")))
+def run():
+    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", DEFAULT_INPUT))
+    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", DEFAULT_OUTPUT))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for source in sorted(input_dir.glob("*.in")):
+        try:
+            with source.open("r", encoding="utf-8") as handle:
+                case = json.load(handle)
+        except (OSError, ValueError):
+            case = {}
+        result = _forecast(case)
+        target = output_dir / (source.stem + ".out")
+        with target.open("w", encoding="utf-8") as handle:
+            json.dump(result, handle, separators=(",", ":"))
+            handle.write("\n")
 
 
 if __name__ == "__main__":
-    main()
-
-Z = {5: -1.6449, 25: -0.6745, 50: 0.0, 75: 0.6745, 95: 1.6449}
-HORIZON_D = 23          # offsets d = 0..23 -> hours 1..24
-SCAN_WINDOW = 72        # unlock jump searched within first 72 hourly entries
-MIN_ROWS = 8            # comparables with fewer hourly rows are skipped
-Q_CAP = 1e9
-
-
-def _viewers(row):
-    """Extract the viewers value from a row (dict or bare number)."""
-    if isinstance(row, dict):
-        for key in ("viewers", "viewership", "views", "value"):
-            if key in row:
-                return float(row[key])
-        raise KeyError("no viewers field in row")
-    return float(row)
-
-
-def _mean(xs):
-    return sum(xs) / len(xs)
-
-
-def _sample_std(xs):
-    if len(xs) < 2:
-        return 0.0
-    mu = _mean(xs)
-    var = sum((x - mu) ** 2 for x in xs) / (len(xs) - 1)
-    return math.sqrt(var)
-
-
-def _p1(case):
-    """Hour-1 viewers print from the case's own 'known' rows."""
-    rows = case.get("known") or []
-    by_hour = {}
-    for row in rows:
-        if isinstance(row, dict):
-            hour = int(row.get("hour", 1))
-            by_hour[hour] = _viewers(row)
-        else:
-            by_hour.setdefault(1, _viewers(row))
-    if 1 in by_hour:
-        return by_hour[1]
-    if by_hour:
-        return by_hour[min(by_hour)]
-    raise ValueError("case has no hour-1 'known' viewers")
-
-
-def _unlock_hour(series):
-    """Index of the biggest one-hour log jump within the first SCAN_WINDOW."""
-    n = min(SCAN_WINDOW, len(series))
-    best_u, best_jump = None, None
-    for u in range(1, n):
-        prev, cur = series[u - 1], series[u]
-        if prev <= 0.0 or cur <= 0.0:
-            continue
-        jump = math.log(cur) - math.log(prev)
-        if best_jump is None or jump > best_jump:
-            best_u, best_jump = u, jump
-    if best_u is None:
-        return None
-    return best_u
-
-
-def forecast_case(case):
-    p1 = _p1(case)
-
-    # Per-offset log ratios relative to each comparable's unlock hour.
-    ratios = {d: [] for d in range(HORIZON_D + 1)}
-    for comp in case.get("comparables") or []:
-        series = [_viewers(r) for r in (comp.get("hourly") or comp.get("hours") or comp if isinstance(comp, list) else comp.get("hourly") or [])]
-        if len(series) < MIN_ROWS:
-            continue
-        u = _unlock_hour(series)
-        if u is None or series[u] <= 0.0 or series[u - 1] <= 0.0:
-            continue
-        for d in range(HORIZON_D + 1):
-            idx = u + d
-            if idx < len(series) and series[idx] > 0.0:
-                ratios[d].append(math.log(series[idx] / series[u]))
-
-    # Mean log-ratio curve; m[0] is exactly 0 by construction.
-    m = [0.0] + [_mean(ratios[d]) if ratios[d] else 0.0 for d in range(1, HORIZON_D + 1)]
-
-    # Smooth m with a 1-2-1 kernel, ends handled by clamping indices.
-    ms = []
-    for d in range(HORIZON_D + 1):
-        lo = m[max(d - 1, 0)]
-        hi = m[min(d + 1, HORIZON_D)]
-        ms.append((lo + 2.0 * m[d] + hi) / 4.0)
-
-    hours = []
-    for h in range(2, 25):
-        d = h - 1
-        w = d / (d + 3.0)
-        s = _sample_std(ratios[d]) if ratios[d] else 0.0
-        median = p1 * math.exp(w * ms[d])
-        sigma = math.sqrt((0.15 * math.sqrt(d)) ** 2 + (w * s) ** 2)
-        qs = []
-        for tau in (5, 25, 50, 75, 95):
-            q = median * math.exp(Z[tau] * sigma)
-            q = min(max(q, 1e-9), Q_CAP) if q <= 0.0 else min(q, Q_CAP)
-            qs.append(round(q, 2))
-        hours.append({"hour": h, "q": sorted(qs)})
-    return {"hours": hours}
+    run()

@@ -1,0 +1,25 @@
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:/hermes-agent/**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:/hermes-agent/**) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:/VY-WORK/**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:/VY-WORK/**) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:\\hermes-agent\\**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:\\hermes-agent\\**) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:\\VY-WORK\\**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:\\VY-WORK\\**) instead (Edit rules cover all file-editing tools).
+Claude Code doesn't recognize the model "deepseek-v4.1-flash:dev", so it assumes a context window of 200k tokens. Update Claude Code, or see https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id to set the window.
+[claude-code:unrecognized_model] {"model":"deepseek-v4.1-flash:dev","query_source":"sdk"}
+**How the model in `main.py` works**
+
+The program is a weighted-comparable retention blender. It never tries to model the target title directly; instead it asks "how did similar releases decay after their own launch spike?" and transfers that shape onto the target's known hour-1 peak.
+
+Timestamps are handled without any date library. Each ISO string is split into a civil date and a time-of-day, the date is converted to an integer day count by the standard era/year-of-era arithmetic, and the result is a pair `(day, seconds)`. All later arithmetic — gaps between comparables and the checkpoint, hours since a comparable's `day_start` — is done on that pair, so day boundaries and midnight crossings never need special cases. Timezone offsets are treated as noise and stripped; `Z` is removed explicitly.
+
+For every comparable, the sparse `hourly` points are converted into a lookup keyed by rounded hour-since-`day_start`. Samples that fail to parse, have negative viewer counts, or are non-finite are silently skipped, so a malformed row degrades one point rather than the whole case. Duplicate hour indices overwrite each other.
+
+Unlock detection looks only at the first 72 samples. For each step it computes the growth rate of log viewers per hour — dividing by the index gap matters because the series can be sparse, otherwise a two-hour gap with a small absolute rise would beat a one-hour gap with a large one. The steepest positive step becomes the unlock hour. If nothing rises at all, it falls back to the first sample. Everything before that index is discarded as pre-release noise; the series is then re-referenced so that the unlock hour has ratio 1.0 and every later sample is `viewers(unlock+h) / viewers(unlock)`, stored for lags 1 through 23 — exactly the 23 horizons needed.
+
+The blend weight for a comparable is `1 / (1 + gap/30)` where `gap` is the absolute difference in whole days between the checkpoint date and that comparable's `day_start`. At zero days the weight is 1.0; at 30 days it's 0.5; anything below 0.05 is dropped entirely. That threshold means comparables roughly 19 months or more away get no vote.
+
+The baseline `B` is the largest single viewer value anywhere in the comparable data — computed across *all* comparables, including ones later dropped by the weight filter, since the spike magnitude is the case's best proxy for the hour-1 peak regardless of whether that particular title is date-close enough to shape the curve.
+
+For target hour `t` the lag is `t-1`. Each comparable's ratio at that lag is looked up by geometric interpolation between the nearest sampled lags (linear in log space), or held flat beyond the last sample, then clipped to `[1/50, 2]` so a single wild ratio can't dominate. The per-comparable log-ratios are averaged with the weights as a geometric mean, and `exp` of that average multiplies `B` to give the median.
+
+Two guards shape the early curve: hour 2 is capped at 90% of `B` and hour 3 at 90%×92% of `B`, so the median is always visibly below the hour-1 baseline even when the comparable data says the release held flat. A running minimum then forces medians to be non-increasing across hours 2–24, which prevents a flat-but-noisy composite from producing a bump.
+
+Uncertainty grows with the horizon: `sigma = 0.15*sqrt(t)`, plus `0.015*(t-12)` once `t` passes 12 so the tail keeps widening rather than flattening. Quantiles are log-normal multipliers of the median at ±1.645σ (5th/95th) and ±0.674σ (25th/75th), giving asymmetric bands, and each value is rounded to two decimals before being written as a single JSON line per case.

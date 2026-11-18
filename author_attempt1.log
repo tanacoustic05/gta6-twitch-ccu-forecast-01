@@ -1,0 +1,11 @@
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:/hermes-agent/**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:/hermes-agent/**) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:/VY-WORK/**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:/VY-WORK/**) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:\\hermes-agent\\**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:\\hermes-agent\\**) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Admin\.claude\settings.json): Write(D:\\VY-WORK\\**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(D:\\VY-WORK\\**) instead (Edit rules cover all file-editing tools).
+Claude Code doesn't recognize the model "deepseek-v4.1-flash:dev", so it assumes a context window of 200k tokens. Update Claude Code, or see https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id to set the window.
+[claude-code:unrecognized_model] {"model":"deepseek-v4.1-flash:dev","query_source":"sdk"}
+All four cases run cleanly, each producing one line of JSON with 23 entries for hours 2–24 (all medians monotone non-increasing, all quantile bands well-ordered).
+
+1. **p00**: hour-2 median 966,830 falling to 239,148 by hour 24, with a 90% band spanning 53k–1.08M at the tail.
+2. **p01**: the flattest curve — 1,276,285 at hour 2 to 966,231 at hour 24, and the widest spread (q95 reaching 4.35M).
+3. **p02 / p03**: steep early drop-offs from 811,388 / 762,059 at hour 2 down to 97,611 / 167,664 by hour 24, with late-hour q95 climbing (440k and 755k) as the spread widens.
