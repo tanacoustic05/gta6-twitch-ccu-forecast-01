@@ -1,48 +1,41 @@
-# Hourly Viewer Forecaster
+# Twitch CCU launch forecaster
 
-A small, dependency-free Python 3.13 program that projects Twitch-style
-concurrent-viewer counts for a title release across hours 2 through 24.
-Given a checkpoint marking the end of hour 1 and a set of comparable
-releases, it produces a median path plus four surrounding quantiles for
-every hour, written as one JSON line per case.
+A small offline Python program that predicts the first-day concurrent-viewer
+curve of a newly launched Twitch channel. Given one early print (the viewer
+count at hour 1) it returns five quantiles for each hour from 2 through 24.
 
-## How the blend works
+## How it works
 
-Each comparable's hourly series is rescaled to the hour where its viewer
-count jumps hardest — that jump is treated as its own unlock, and anything
-earlier is discarded as pre-release noise. What remains becomes a retention
-curve relative to the unlock hour. Comparables count more heavily when their
-start date is close to the target's checkpoint (weight `1 / (1 + gap/30)`,
-dropping anything under `0.05`).
+The forecast is built from *comparable launches* — earlier channels whose
+first-day curves are already known. For each comparable the program divides
+every hourly sample by that channel's own hour-1 value, which turns each curve
+into a scale-free shape. Comparables marked as not being launches are ignored,
+and a comparable must cover at least 15 of the hours 2–24 with a positive
+hour-1 sample to be used at all.
 
-For each horizon the per-comparable retention ratios are geometrically
-interpolated, clamped to `[1/50, 2]`, and combined as a weighted geometric
-mean. That composite ratio is applied to the target baseline, which is the
-largest single viewer value seen anywhere in the comparable data — a proxy
-for the release spike at the end of hour 1. Medians are forced downward
-across hours, and the spread is modelled as `0.15 * sqrt(hour)`, widening
-further past hour 12 so long horizons stay honestly uncertain. Quantiles use
-log-normal multipliers, so the bands are asymmetric around the median.
+For every target hour the ratios from all usable comparables are sorted and
+reduced to a median, a minimum and a maximum. The outer quantiles blend the
+median with the extremes in log space (70% median, 30% tail), while the inner
+two use a fixed log-normal spread of sigma 0.45 around the median. The five
+ratios are then multiplied by the case's hour-1 count to give viewer numbers.
 
-## Running
+Output is always clamped to at least 1.0, ordered low to high within an hour,
+and never allowed to drop below the previous hour, so the curve stays sane even
+when the comparable set is thin or noisy.
 
-From the kit root, with `input/` holding the case files:
+## Running it
 
-```bash
-mkdir -p out
+```
 MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python main.py
 ```
 
-Both environment variables default to `/input` and `/output`. Every `*.in`
-file is read and a matching `*.out` file is written. Output shape:
+Both variables default to `/input` and `/output`. Every `*.in` file in the
+input directory (a JSON case with the `makefun/twitch-ccu-case/v1` schema) is
+read in name order and written to `out/<stem>.out` as a single JSON line with
+an `hours` array of 23 entries, each holding `hour` and its five `q` values.
 
-```json
-{"hours":[{"hour":2,"q":[q5,q25,q50,q75,q95]}, ... {"hour":24, ...}]}
-```
-
-Twenty-three entries, quantiles rounded to two decimals. No network access,
-no randomness, standard library only — the same inputs always give the same
-numbers.
+The program uses only the standard library, never touches the network, and is
+fully deterministic — the same inputs always produce byte-identical output.
 
 ## License
 
